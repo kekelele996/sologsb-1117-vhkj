@@ -36,7 +36,7 @@ VITE_AMAP_KEY=            # 可选，留空即自动降级为本地 SVG 网格�
 | 状态管理 | Zustand |
 | 路由 | React Router 6（nginx `try_files` 回落） |
 | 构建 | Vite 5 |
-| 本地存储 | IndexedDB（Dexie 封装，含 `schemaVersion` 与升级迁移） |
+| 本地存储 | IndexedDB（Dexie 封装，含 `schemaVersion=3` 与升级迁移） |
 | 部署 | 多阶段 Dockerfile：`node:20-alpine` 构建 → `nginx:alpine` 托管 |
 
 ## 三、高德地图 Key 与降级策略
@@ -68,11 +68,11 @@ sologsb-1117/
 │   └── src/
 │       ├── types/              # orchard.ts / colony.ts / droppoint.ts / route.ts / index.ts
 │       ├── stores/             # orchardStore / colonyStore / droppointStore / routeStore（Zustand）
-│       ├── components/common/  # RouteMap / FlowerWindowBar / StatusTag / CoordPicker
+│       ├── components/common/  # RouteMap / RouteLegCard / FlowerWindowBar / StatusTag / CoordPicker
 │       ├── hooks/              # useAmap / usePersistentStore
 │       ├── pages/              # SchedulePage / OrchardsPage / ColoniesPage / RoutesPage / ExportPage
 │       ├── router/index.tsx
-│       └── utils/              # geo.ts / export.ts / id.ts
+│       └── utils/              # geo.ts / loading.ts / export.ts / id.ts
 ```
 
 ## 六、数据模型与存储
@@ -82,10 +82,11 @@ sologsb-1117/
 | Orchard 果园地块 | 地块名、作物、面积、经纬度、盛花期起止、需蜂强度（箱/亩）、园主联系方式、可达性、历史授粉年份 | `orchards` |
 | BeeColony 蜂群 | 群号、蜂种、群势（足框）、箱型、当前所在地块、状态（待投放/在园/转场中/回场）、最近检查日期、健康备注 | `colonies` |
 | DropPoint 投放点 | 所属地块、坐标、编号、可容纳箱数、遮阴条件、水源距离、投放时间窗、撤场时间、责任人、安排群号 | `dropPoints` |
-| TransitRoute 转场路线 | 出发/到达投放点、预计里程与耗时、车辆类型、出发时刻、风险备注、实际记录 | `routes` |
+| TransitRoute 转场路线 | 出发/到达投放点、预计里程与耗时、车辆类型、出发时刻、风险备注、实际记录、装车清单（车次/群号/箱型组/实际出发到达） | `routes` |
 
 - 数据库名 `gbbeeroute`，`meta` 表保存 `schemaVersion`；
 - `version(2)` 升级迁移会为历史投放点补齐「可容纳箱数」（默认 8 箱）；
+- `version(3)` 升级迁移会为历史转场路线补齐空装车清单 `trips`（车次信息全部挂在该字段下）；
 - 数据仅存于浏览器本地，容器无状态、不挂载命名卷。
 
 ## 七、主要页面
@@ -95,11 +96,21 @@ sologsb-1117/
 | `/` | 季内授粉安排总表：花期条带 + 已投放群体，冲突（同一蜂群被排入花期重叠的不同地块）标红并汇总 |
 | `/orchards` | 果园地块管理：面积与需蜂强度自动算建议箱数、可达性标记、花期重叠提示、投放点维护（含坐标拾取） |
 | `/colonies` | 蜂群台账：按群势与状态筛选，批量改状态、批量记录检查备注 |
-| `/routes` | 转场路线规划：地图依次选点生成顺序与里程，拖动或上下移动调整顺序并实时重算，写回路线表 |
-| `/export` | 导出授粉安排清单 / 转场路线表（CSV）、全量 JSON 备份，并提供横向/纵向打印视图 |
+| `/routes` | 转场路线规划：地图依次选点生成顺序与里程，拖动或上下移动调整顺序并实时重算；保存后按到达站已安排群号生成装车清单，司机逐车点发车 / 到站确认 |
+| `/export` | 导出授粉安排清单 / 装车清单 / 转场路线表（CSV，均带车次与群号）、全量 JSON 备份，并提供横向/纵向打印视图 |
 
-## 八、计算约定
+## 八、装车与转场执行约定
+
+- **装车范围**：只装到达站投放点已安排、且蜂群状态为「待投放 / 回场」的群号；已在园 / 转场中的群自动跳过并在路线卡片上提示，安排了但台账查无此群的群号标红；
+- **车型容量（箱/车）**：厢式货车 18、农用三轮 8、皮卡 6、人工搬运 2；按到达段选用的车型统一分车，**超载部分顺延到下一车**；
+- **箱型不混装**：交尾箱单独成组，标准继箱与平箱归入标准箱组，两组各自按容量分车；车次先排标准箱组、再排交尾箱组，车次号在段内从 1 连续编号；
+- **发车**：司机对某车次点「发车」后，该车全部群号一起改为「转场中」，并记录实际出发时间（不可重复发车）；
+- **到站确认**：点「到站确认」后，该车群号改为「在园」、当前所在地块同步为到达投放点所属地块，并记录实际到达时间；
+- 装车清单（路线卡片）、路线卡片标题与导出表（CSV / 打印）均带**段次、车次与群号**。
+
+## 九、计算约定
 
 - 建议箱数 = ⌈面积(亩) × 需蜂强度(箱/亩)⌉，最少 1 箱；
 - 转场里程按 Haversine 球面距离累计，耗时按平均 32 km/h + 0.25 h 装卸估算；
-- 花期重叠：两地块盛花期区间交集天数 ≥ 1 即视为重叠；同一群号在重叠期内被排入两个地块 → 冲突。
+- 花期重叠：两地块盛花期区间交集天数 ≥ 1 即视为重叠；同一群号在重叠期内被排入两个地块 → 冲突；
+- 装车车次按 `utils/loading.ts` 的 `planLoads` 计算，车型容量见 `VEHICLE_CAPACITY`。

@@ -1,19 +1,22 @@
 import { useMemo, useState } from 'react'
-import { Button, Card, Col, DatePicker, Empty, Form, Input, Row, Select, Space, Table, Tag, Typography, message } from 'antd'
+import { Button, Card, Col, DatePicker, Empty, Form, Input, Row, Select, Space, Tag, Typography, message } from 'antd'
 import dayjs from 'dayjs'
 import type { DropPoint, TransitRoute } from '@/types'
 import { VEHICLE_TYPES } from '@/types'
 import RouteMap from '@/components/common/RouteMap'
+import RouteLegCard from '@/components/common/RouteLegCard'
 import { usePersistentStore } from '@/hooks/usePersistentStore'
 import { orchardStore } from '@/stores/orchardStore'
 import { droppointStore } from '@/stores/droppointStore'
+import { colonyStore } from '@/stores/colonyStore'
 import { routeStore } from '@/stores/routeStore'
 import { distanceKm, estimateDurationH, routeLegs } from '@/utils/geo'
 
-/** 转场路线规划：地图上依次选点生成顺序与里程，支持拖动调整顺序并重算 */
+/** 转场路线规划：地图上依次选点生成顺序与里程，支持拖动调整顺序并重算；路线保存后按到达站群号生成装车清单 */
 export default function RoutesPage(): JSX.Element {
   const orchards = usePersistentStore(orchardStore, (state) => state.rows)
   const dropPoints = usePersistentStore(droppointStore, (state) => state.rows)
+  const colonies = usePersistentStore(colonyStore, (state) => state.rows)
   const routes = usePersistentStore(routeStore, (state) => state.rows)
 
   const [orderedIds, setOrderedIds] = useState<string[]>([])
@@ -76,7 +79,7 @@ export default function RoutesPage(): JSX.Element {
       departAt: departAt.format('YYYY-MM-DDTHH:mm'),
       riskNote: riskNote.trim()
     })
-    message.success(`已生成 ${orderedIds.length - 1} 段转场路线，累计 ${legs.total} km`)
+    message.success(`已生成 ${orderedIds.length - 1} 段转场路线与装车清单，累计 ${legs.total} km，司机可逐车发车`)
   }
 
   return (
@@ -85,7 +88,8 @@ export default function RoutesPage(): JSX.Element {
         <div>
           <h2 className="page-title">转场路线规划</h2>
           <p className="page-sub">
-            在投放点列表中依次选点生成转场顺序与里程；可拖动条目或上下移动调整顺序，里程与耗时实时重算，确认后写回路线表。
+            在投放点列表中依次选点生成转场顺序与里程；可拖动条目或上下移动调整顺序，里程与耗时实时重算。路线保存后，按到达站已安排且待投放 /
+            回场的群号生成装车清单：厢式货车 18 箱、农用三轮 8 箱、皮卡 6 箱、人工搬运 2 箱，交尾箱与标准箱不混装、超载顺延下一车；司机逐车点发车与到站确认。
           </p>
         </div>
         <Space>
@@ -195,47 +199,35 @@ export default function RoutesPage(): JSX.Element {
         </Col>
       </Row>
 
-      <Card size="small" title={`已保存的转场路线（${routes.length} 段 · 合计 ${Math.round(routes.reduce((sum, item) => sum + item.distanceKm, 0) * 100) / 100} km）`}>
-        <Table<TransitRoute>
-          dataSource={routes}
-          rowKey="id"
-          pagination={false}
-          columns={[
-            {
-              title: '出发',
-              key: 'from',
-              render: (_, record: TransitRoute) => {
-                const point = dropPoints.find((item) => item.id === record.fromDropId)
-                return point ? `${point.code}（${orchardName(point.orchardId)}）` : '—'
-              }
-            },
-            {
-              title: '到达',
-              key: 'to',
-              render: (_, record: TransitRoute) => {
-                const point = dropPoints.find((item) => item.id === record.toDropId)
-                return point ? `${point.code}（${orchardName(point.orchardId)}）` : '—'
-              }
-            },
-            { title: '里程（km）', dataIndex: 'distanceKm', key: 'km', width: 110 },
-            { title: '预计耗时（h）', dataIndex: 'durationH', key: 'hour', width: 130 },
-            { title: '车辆', dataIndex: 'vehicleType', key: 'vehicle', width: 110 },
-            { title: '出发时刻', dataIndex: 'departAt', key: 'depart', width: 160 },
-            { title: '风险备注', dataIndex: 'riskNote', key: 'risk', render: (value: string) => value || '—' },
-            { title: '实际记录', dataIndex: 'actualNote', key: 'actual', width: 120 },
-            {
-              title: '操作',
-              key: 'action',
-              width: 80,
-              render: (_, record: TransitRoute) => (
-                <Button size="small" danger type="link" onClick={() => void routeStore.getState().remove(record.id)}>
-                  删除
-                </Button>
-              )
-            }
-          ]}
-        />
-      </Card>
+      <div>
+        <Typography.Title level={5} style={{ marginBottom: 10 }}>
+          已保存的转场路线与装车清单（{routes.length} 段 · 合计 {Math.round(routes.reduce((sum, item) => sum + item.distanceKm, 0) * 100) / 100}{' '}
+          km · {routes.reduce((sum, item) => sum + item.trips.length, 0)} 车）
+        </Typography.Title>
+        {routes.length === 0 ? (
+          <Card size="small">
+            <Empty description="尚未生成转场路线，请先在上方选择投放点顺序并保存" />
+          </Card>
+        ) : (
+          <Space direction="vertical" style={{ width: '100%' }} size={12}>
+            {routes.map((record: TransitRoute, index) => (
+              <RouteLegCard
+                key={record.id}
+                legIndex={index + 1}
+                route={record}
+                fromPoint={dropPoints.find((item) => item.id === record.fromDropId)}
+                toPoint={dropPoints.find((item) => item.id === record.toDropId)}
+                orchardName={orchardName}
+                colonies={colonies}
+                onGenerate={(routeId) => routeStore.getState().generateLoads(routeId)}
+                onDepart={(routeId, tripId, departedAt) => routeStore.getState().departTrip(routeId, tripId, departedAt)}
+                onArrive={(routeId, tripId, arrivedAt) => routeStore.getState().arriveTrip(routeId, tripId, arrivedAt)}
+                onRemove={(routeId) => routeStore.getState().remove(routeId)}
+              />
+            ))}
+          </Space>
+        )}
+      </div>
     </div>
   )
 }

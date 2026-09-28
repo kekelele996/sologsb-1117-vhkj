@@ -2,9 +2,10 @@ import { useStore } from 'zustand'
 import type { StoreApi, UseBoundStore } from 'zustand'
 import Dexie, { type Table } from 'dexie'
 import type { BeeColony, DropPoint, Orchard, TransitRoute } from '@/types'
+import { planLoads, toRouteTrips } from '@/utils/loading'
 
 /** IndexedDB 数据结构版本号 */
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
 export interface MetaRow {
   key: string
@@ -29,7 +30,7 @@ class BeeRouteDb extends Dexie {
       meta: 'key'
     })
     // v2：投放点新增「可容纳箱数」字段，迁移时为历史投放点补齐（按 8 箱兜底）
-    this.version(SCHEMA_VERSION)
+    this.version(2)
       .stores({
         orchards: 'id, name, crop, bloomStart',
         colonies: 'id, code, status, currentOrchardId',
@@ -44,6 +45,25 @@ class BeeRouteDb extends Dexie {
           .modify((point) => {
             if (!point.capacityBoxes) {
               point.capacityBoxes = 8
+            }
+          })
+      })
+    // v3：转场路线新增装车清单（车次 / 群号 / 实际出发到达），迁移时为历史路线补齐空车次
+    this.version(SCHEMA_VERSION)
+      .stores({
+        orchards: 'id, name, crop, bloomStart',
+        colonies: 'id, code, status, currentOrchardId',
+        dropPoints: 'id, orchardId, code, dropWindow',
+        routes: 'id, fromDropId, toDropId, departAt',
+        meta: 'key'
+      })
+      .upgrade(async (tx) => {
+        await tx
+          .table<TransitRoute, string>('routes')
+          .toCollection()
+          .modify((route) => {
+            if (!Array.isArray(route.trips)) {
+              route.trips = []
             }
           })
       })
@@ -148,7 +168,7 @@ export async function seedDemoData(): Promise<void> {
       strengthFrames: 8,
       boxType: '标准继箱',
       currentOrchardId: 'orc_ap',
-      status: '在园',
+      status: '待投放',
       lastCheckDate: `${year}-04-09`,
       healthNote: '群势稳定，子脾整齐'
     },
@@ -173,10 +193,109 @@ export async function seedDemoData(): Promise<void> {
       status: '待投放',
       lastCheckDate: `${year}-04-02`,
       healthNote: '新分群，群势偏弱'
+    },
+    {
+      id: 'col_004',
+      code: 'Q-04',
+      species: '意蜂',
+      strengthFrames: 9,
+      boxType: '标准继箱',
+      currentOrchardId: 'orc_ap',
+      status: '在园',
+      lastCheckDate: `${year}-04-09`,
+      healthNote: '强群，继箱已满'
+    },
+    {
+      id: 'col_005',
+      code: 'Q-05',
+      species: '意蜂',
+      strengthFrames: 7,
+      boxType: '标准继箱',
+      currentOrchardId: '',
+      status: '待投放',
+      lastCheckDate: `${year}-04-08`,
+      healthNote: ''
+    },
+    {
+      id: 'col_006',
+      code: 'Q-06',
+      species: '意蜂',
+      strengthFrames: 7,
+      boxType: '标准继箱',
+      currentOrchardId: '',
+      status: '待投放',
+      lastCheckDate: `${year}-04-08`,
+      healthNote: ''
+    },
+    {
+      id: 'col_007',
+      code: 'Q-07',
+      species: '中蜂',
+      strengthFrames: 5,
+      boxType: '平箱',
+      currentOrchardId: '',
+      status: '待投放',
+      lastCheckDate: `${year}-04-08`,
+      healthNote: ''
+    },
+    {
+      id: 'col_008',
+      code: 'Q-08',
+      species: '中蜂',
+      strengthFrames: 5,
+      boxType: '平箱',
+      currentOrchardId: '',
+      status: '待投放',
+      lastCheckDate: `${year}-04-08`,
+      healthNote: ''
+    },
+    {
+      id: 'col_009',
+      code: 'Q-09',
+      species: '意蜂',
+      strengthFrames: 6,
+      boxType: '标准继箱',
+      currentOrchardId: '',
+      status: '回场',
+      lastCheckDate: `${year}-04-06`,
+      healthNote: '已回场休整，待下一轮投放'
+    },
+    {
+      id: 'col_010',
+      code: 'Q-10',
+      species: '意蜂',
+      strengthFrames: 3,
+      boxType: '交尾箱',
+      currentOrchardId: '',
+      status: '待投放',
+      lastCheckDate: `${year}-04-10`,
+      healthNote: '新王交尾群，单独装车'
+    },
+    {
+      id: 'col_011',
+      code: 'Q-11',
+      species: '意蜂',
+      strengthFrames: 3,
+      boxType: '交尾箱',
+      currentOrchardId: '',
+      status: '待投放',
+      lastCheckDate: `${year}-04-10`,
+      healthNote: '新王交尾群，单独装车'
+    },
+    {
+      id: 'col_012',
+      code: 'Q-12',
+      species: '意蜂',
+      strengthFrames: 2,
+      boxType: '交尾箱',
+      currentOrchardId: '',
+      status: '待投放',
+      lastCheckDate: `${year}-04-10`,
+      healthNote: '新王交尾群，单独装车'
     }
   ])
 
-  await db.dropPoints.bulkPut([
+  const seedDropPoints: DropPoint[] = [
     {
       id: 'dp_a01',
       orchardId: 'orc_ap',
@@ -189,7 +308,7 @@ export async function seedDemoData(): Promise<void> {
       dropWindow: `${year}-04-07`,
       withdrawTime: `${year}-04-19`,
       owner: '周园主',
-      colonyCodes: ['Q-01']
+      colonyCodes: ['Q-04']
     },
     {
       id: 'dp_b01',
@@ -211,15 +330,20 @@ export async function seedDemoData(): Promise<void> {
       longitude: 107.3741,
       latitude: 34.5902,
       code: 'C-01',
-      capacityBoxes: 6,
+      capacityBoxes: 14,
       shade: '坡顶两株核桃树遮阴',
       waterDistance: 350,
       dropWindow: `${year}-04-11`,
       withdrawTime: `${year}-04-22`,
       owner: '李园主',
-      colonyCodes: ['Q-02']
+      colonyCodes: ['Q-01', 'Q-02', 'Q-03', 'Q-05', 'Q-06', 'Q-07', 'Q-08', 'Q-09', 'Q-10', 'Q-11', 'Q-12']
     }
-  ])
+  ]
+  await db.dropPoints.bulkPut(seedDropPoints)
+
+  // 示例路线直接带出装车清单：皮卡 6 箱/车，标准箱 7 群（Q-02 转场中跳过）→ 2 车，交尾箱 3 群 → 1 车
+  const seedColonies = await db.colonies.toArray()
+  const demoPlan = planLoads(seedDropPoints[2].colonyCodes, seedColonies, '皮卡')
 
   await db.routes.bulkPut([
     {
@@ -228,10 +352,11 @@ export async function seedDemoData(): Promise<void> {
       toDropId: 'dp_c01',
       distanceKm: 9.4,
       durationH: 0.54,
-      vehicleType: '农用三轮',
+      vehicleType: '皮卡',
       departAt: `${year}-04-13T06:30`,
       riskNote: '西沟坡道窄，雨天泥泞，需小车倒运',
-      actualNote: '待执行'
+      actualNote: '待执行',
+      trips: toRouteTrips(demoPlan.trips)
     }
   ])
 }
