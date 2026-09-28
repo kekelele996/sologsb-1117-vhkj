@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react'
 import { Button, Card, Col, Radio, Row, Space, Table, Tag, Typography, message } from 'antd'
 import dayjs from 'dayjs'
 import type { BeeColony, DropPoint, Orchard, TransitRoute } from '@/types'
-import { suggestColonyBoxes } from '@/types'
+import { suggestColonyBoxes, VEHICLE_CAPACITY } from '@/types'
 import { usePersistentStore } from '@/hooks/usePersistentStore'
 import { orchardStore } from '@/stores/orchardStore'
 import { colonyStore } from '@/stores/colonyStore'
@@ -10,6 +10,7 @@ import { droppointStore } from '@/stores/droppointStore'
 import { routeStore } from '@/stores/routeStore'
 import { downloadCsv, downloadJson } from '@/utils/export'
 import { bloomDays } from '@/utils/geo'
+import { boxLoadKind } from '@/utils/loading'
 
 interface ScheduleExportRow {
   orchard: string
@@ -25,7 +26,41 @@ interface ScheduleExportRow {
   owner: string
 }
 
-/** 导出授粉安排清单与转场路线表，并提供打印视图 */
+/** 转场路线表（每车次一行） */
+interface RouteTripRow {
+  legNo: number
+  tripNo: number
+  from: string
+  to: string
+  distanceKm: number
+  durationH: number
+  vehicleType: string
+  capacity: number
+  boxCount: number
+  status: string
+  colonyCodes: string
+  departAt: string
+  actualDepartAt: string
+  actualArriveAt: string
+  riskNote: string
+}
+
+/** 装车清单（每群一行，方便司机逐群清点） */
+interface LoadManifestRow {
+  legNo: number
+  tripNo: number
+  from: string
+  to: string
+  vehicleType: string
+  status: string
+  colonyCode: string
+  boxType: string
+  loadKind: string
+  actualDepartAt: string
+  actualArriveAt: string
+}
+
+/** 导出授粉安排清单与转场路线表 / 装车清单，并提供打印视图 */
 export default function ExportPage(): JSX.Element {
   const orchards = usePersistentStore(orchardStore, (state) => state.rows)
   const colonies = usePersistentStore(colonyStore, (state) => state.rows)
@@ -34,6 +69,7 @@ export default function ExportPage(): JSX.Element {
   const [orientation, setOrientation] = useState<'portrait' | 'landscape'>('landscape')
 
   const orchardName = (id: string): string => orchards.find((item) => item.id === id)?.name ?? '未知地块'
+  const colonyByCode = useMemo(() => new Map(colonies.map((colony) => [colony.code, colony])), [colonies])
 
   /** 授粉安排清单：地块 × 投放点 × 群号 */
   const scheduleRows = useMemo<ScheduleExportRow[]>(() => {
@@ -79,25 +115,90 @@ export default function ExportPage(): JSX.Element {
     return rows
   }, [orchards, dropPoints])
 
-  const routeRows = useMemo(
-    () =>
-      routes.map((route: TransitRoute) => {
-        const from = dropPoints.find((item) => item.id === route.fromDropId)
-        const to = dropPoints.find((item) => item.id === route.toDropId)
-        return {
-          from: from ? `${from.code}（${orchardName(from.orchardId)}）` : '—',
-          to: to ? `${to.code}（${orchardName(to.orchardId)}）` : '—',
+  /** 路线卡片：车次 × 群号 */
+  const routeTripRows = useMemo<RouteTripRow[]>(() => {
+    const rows: RouteTripRow[] = []
+    routes.forEach((route: TransitRoute, legIndex) => {
+      const from = dropPoints.find((item) => item.id === route.fromDropId)
+      const to = dropPoints.find((item) => item.id === route.toDropId)
+      const fromText = from ? `${from.code}（${orchardName(from.orchardId)}）` : '—'
+      const toText = to ? `${to.code}（${orchardName(to.orchardId)}）` : '—'
+      const loads = route.loads ?? []
+      if (loads.length === 0) {
+        rows.push({
+          legNo: legIndex + 1,
+          tripNo: 0,
+          from: fromText,
+          to: toText,
           distanceKm: route.distanceKm,
           durationH: route.durationH,
           vehicleType: route.vehicleType,
-          departAt: route.departAt,
-          riskNote: route.riskNote || '—',
-          actualNote: route.actualNote || '—'
-        }
-      }),
+          capacity: VEHICLE_CAPACITY[route.vehicleType],
+          boxCount: 0,
+          status: '未装车',
+          colonyCodes: '—',
+          departAt: route.departAt.replace('T', ' '),
+          actualDepartAt: '—',
+          actualArriveAt: '—',
+          riskNote: route.riskNote || '—'
+        })
+        return
+      }
+      loads.forEach((load) => {
+        rows.push({
+          legNo: legIndex + 1,
+          tripNo: load.tripNo,
+          from: fromText,
+          to: toText,
+          distanceKm: route.distanceKm,
+          durationH: route.durationH,
+          vehicleType: route.vehicleType,
+          capacity: VEHICLE_CAPACITY[route.vehicleType],
+          boxCount: load.colonyCodes.length,
+          status: load.status,
+          colonyCodes: load.colonyCodes.join('、'),
+          departAt: route.departAt.replace('T', ' '),
+          actualDepartAt: load.actualDepartAt || '—',
+          actualArriveAt: load.actualArriveAt || '—',
+          riskNote: route.riskNote || '—'
+        })
+      })
+    })
+    return rows
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [routes, dropPoints, orchards]
-  )
+  }, [routes, dropPoints, orchards])
+
+  /** 装车清单：展开到每个群号一行 */
+  const loadManifestRows = useMemo<LoadManifestRow[]>(() => {
+    const rows: LoadManifestRow[] = []
+    routes.forEach((route: TransitRoute, legIndex) => {
+      const from = dropPoints.find((item) => item.id === route.fromDropId)
+      const to = dropPoints.find((item) => item.id === route.toDropId)
+      const fromText = from ? `${from.code}（${orchardName(from.orchardId)}）` : '—'
+      const toText = to ? `${to.code}（${orchardName(to.orchardId)}）` : '—'
+      ;(route.loads ?? []).forEach((load) => {
+        load.colonyCodes.forEach((code) => {
+          const colony = colonyByCode.get(code)
+          const boxType = colony?.boxType ?? '—'
+          rows.push({
+            legNo: legIndex + 1,
+            tripNo: load.tripNo,
+            from: fromText,
+            to: toText,
+            vehicleType: route.vehicleType,
+            status: load.status,
+            colonyCode: code,
+            boxType,
+            loadKind: boxType === '—' ? '—' : boxLoadKind(boxType),
+            actualDepartAt: load.actualDepartAt || '—',
+            actualArriveAt: load.actualArriveAt || '—'
+          })
+        })
+      })
+    })
+    return rows
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [routes, dropPoints, orchards, colonyByCode])
 
   function exportSchedule(): void {
     downloadCsv('授粉安排清单.csv', scheduleRows as unknown as Record<string, unknown>[], [
@@ -117,17 +218,41 @@ export default function ExportPage(): JSX.Element {
   }
 
   function exportRoutes(): void {
-    downloadCsv('转场路线表.csv', routeRows as unknown as Record<string, unknown>[], [
+    downloadCsv('转场路线表.csv', routeTripRows as unknown as Record<string, unknown>[], [
+      { key: 'legNo', label: '段次' },
+      { key: 'tripNo', label: '车次' },
       { key: 'from', label: '出发投放点' },
       { key: 'to', label: '到达投放点' },
       { key: 'distanceKm', label: '里程(km)' },
       { key: 'durationH', label: '预计耗时(h)' },
       { key: 'vehicleType', label: '车辆' },
-      { key: 'departAt', label: '出发时刻' },
-      { key: 'riskNote', label: '途中风险' },
-      { key: 'actualNote', label: '实际记录' }
+      { key: 'capacity', label: '额定箱数' },
+      { key: 'boxCount', label: '本车箱数' },
+      { key: 'status', label: '车次状态' },
+      { key: 'colonyCodes', label: '群号' },
+      { key: 'departAt', label: '计划出发' },
+      { key: 'actualDepartAt', label: '实际出发' },
+      { key: 'actualArriveAt', label: '实际到达' },
+      { key: 'riskNote', label: '途中风险' }
     ])
-    message.success('转场路线表已导出')
+    message.success('转场路线表（含车次与群号）已导出')
+  }
+
+  function exportManifest(): void {
+    downloadCsv('装车清单.csv', loadManifestRows as unknown as Record<string, unknown>[], [
+      { key: 'legNo', label: '段次' },
+      { key: 'tripNo', label: '车次' },
+      { key: 'from', label: '出发投放点' },
+      { key: 'to', label: '到达投放点' },
+      { key: 'vehicleType', label: '车辆' },
+      { key: 'status', label: '车次状态' },
+      { key: 'colonyCode', label: '群号' },
+      { key: 'boxType', label: '箱型' },
+      { key: 'loadKind', label: '装车分组' },
+      { key: 'actualDepartAt', label: '实际出发' },
+      { key: 'actualArriveAt', label: '实际到达' }
+    ])
+    message.success('装车清单（车次 × 群号）已导出')
   }
 
   function exportBackup(): void {
@@ -148,7 +273,7 @@ export default function ExportPage(): JSX.Element {
         <div>
           <h2 className="page-title">导出与打印</h2>
           <p className="page-sub">
-            导出授粉安排清单（地块、群号、投放点、时刻、里程）与转场路线表，或直接使用打印视图现场交底。
+            导出授粉安排清单、按车次展开的转场路线表与装车清单（均含车次与群号），或直接使用打印视图现场交底。
           </p>
         </div>
         <Space>
@@ -166,6 +291,7 @@ export default function ExportPage(): JSX.Element {
             导出授粉安排清单（CSV）
           </Button>
           <Button onClick={exportRoutes}>导出转场路线表（CSV）</Button>
+          <Button onClick={exportManifest}>导出装车清单（CSV）</Button>
           <Button onClick={exportBackup}>导出全量 JSON 备份</Button>
           <Tag>地块 {orchards.length}</Tag>
           <Tag>蜂群 {colonies.length}</Tag>
@@ -200,20 +326,58 @@ export default function ExportPage(): JSX.Element {
           />
         </Card>
 
-        <Card size="small" title={`转场路线表（${routeRows.length} 段）`}>
-          <Table
-            dataSource={routeRows}
-            rowKey={(record, index) => `${record.from}-${record.to}-${index ?? 0}`}
+        <Card size="small" title={`路线卡片 · 车次与群号（${routeTripRows.length} 车次）`} style={{ marginBottom: 16 }}>
+          <Table<RouteTripRow>
+            dataSource={routeTripRows}
+            rowKey={(record, index) => `${record.legNo}-${record.tripNo}-${index ?? 0}`}
             size="small"
             pagination={false}
             columns={[
-              { title: '出发投放点', dataIndex: 'from', key: 'from' },
-              { title: '到达投放点', dataIndex: 'to', key: 'to' },
-              { title: '里程(km)', dataIndex: 'distanceKm', key: 'km', width: 100 },
-              { title: '耗时(h)', dataIndex: 'durationH', key: 'hour', width: 90 },
-              { title: '车辆', dataIndex: 'vehicleType', key: 'vehicle', width: 100 },
-              { title: '出发时刻', dataIndex: 'departAt', key: 'depart' },
-              { title: '途中风险', dataIndex: 'riskNote', key: 'risk' }
+              { title: '段次', dataIndex: 'legNo', key: 'leg', width: 60 },
+              {
+                title: '车次',
+                dataIndex: 'tripNo',
+                key: 'trip',
+                width: 70,
+                render: (value: number) => (value > 0 ? `第${value}车` : '—')
+              },
+              { title: '出发', dataIndex: 'from', key: 'from' },
+              { title: '到达', dataIndex: 'to', key: 'to' },
+              { title: '车辆', dataIndex: 'vehicleType', key: 'vehicle', width: 90 },
+              { title: '箱数', key: 'count', width: 80, render: (_, record) => `${record.boxCount}/${record.capacity}` },
+              {
+                title: '状态',
+                dataIndex: 'status',
+                key: 'status',
+                width: 90,
+                render: (value: string) => (
+                  <Tag color={value === '已到站' ? 'green' : value === '转场中' ? 'gold' : value === '待发车' ? 'default' : 'red'}>{value}</Tag>
+                )
+              },
+              { title: '群号', dataIndex: 'colonyCodes', key: 'codes' },
+              { title: '实际出发', dataIndex: 'actualDepartAt', key: 'ad', width: 150 },
+              { title: '实际到达', dataIndex: 'actualArriveAt', key: 'aa', width: 150 }
+            ]}
+          />
+        </Card>
+
+        <Card size="small" title={`装车清单（${loadManifestRows.length} 群，逐群清点）`}>
+          <Table<LoadManifestRow>
+            dataSource={loadManifestRows}
+            rowKey={(record, index) => `${record.legNo}-${record.tripNo}-${record.colonyCode}-${index ?? 0}`}
+            size="small"
+            pagination={false}
+            columns={[
+              { title: '段次', dataIndex: 'legNo', key: 'leg', width: 60 },
+              { title: '车次', dataIndex: 'tripNo', key: 'trip', width: 70, render: (value: number) => `第${value}车` },
+              { title: '出发', dataIndex: 'from', key: 'from' },
+              { title: '到达', dataIndex: 'to', key: 'to' },
+              { title: '群号', dataIndex: 'colonyCode', key: 'code', width: 90 },
+              { title: '箱型', dataIndex: 'boxType', key: 'box', width: 90 },
+              { title: '装车分组', dataIndex: 'loadKind', key: 'kind', width: 90 },
+              { title: '状态', dataIndex: 'status', key: 'status', width: 90 },
+              { title: '实际出发', dataIndex: 'actualDepartAt', key: 'ad', width: 150 },
+              { title: '实际到达', dataIndex: 'actualArriveAt', key: 'aa', width: 150 }
             ]}
           />
         </Card>
@@ -244,7 +408,7 @@ export default function ExportPage(): JSX.Element {
               1. 授粉安排清单按「地块 × 投放点 × 群号」展开，可直接给蜂场与园主核对；
             </Typography.Paragraph>
             <Typography.Paragraph style={{ fontSize: 13, marginBottom: 6 }}>
-              2. 转场路线表包含里程、耗时、车辆与风险备注，实际执行情况可在“转场路线规划”页回填；
+              2. 转场路线表按车次展开（含车次、群号、实际出发 / 到达）；装车清单逐群一行，供司机按车清点、现场交底；
             </Typography.Paragraph>
             <Typography.Paragraph style={{ fontSize: 13, marginBottom: 0 }}>
               3. 点击「打印视图」后再选择打印机或另存 PDF；数据全部来自浏览器本地 IndexedDB。
